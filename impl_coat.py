@@ -429,7 +429,7 @@ if __name__ == '__main__':
     model = model.to(device)
 
     criterion = torch.nn.CrossEntropyLoss()  # computes softmax and then the cross entropy
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.005, momentum=0.5)  # 冲量
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.005, momentum=0.5) 
 
     print("Start training~~~")
     for epoch in range(100):
