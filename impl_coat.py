@@ -1,3 +1,4 @@
+# -*- coding: UTF-8 -*-
 from einops import rearrange
 from einops.layers.torch import Rearrange
 import torch
