@@ -18,7 +18,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.datasets.utils import download_url, check_integrity
 
-DEFAULT_SEED = 123456
+from mlp import DEFAULT_SEED
 
 
 class DataProvider(object):
