@@ -405,13 +405,13 @@ class CoAtNet(nn.Module):
 
 
 
-        self.s0 = self._make_layer(
-            conv_3x3_bn, in_channels, channels[0], num_blocks[0], (ih , iw ))
-
-        self.s1 = self._make_layer(
-            block[block_types[0]], channels[0], channels[1], num_blocks[1], (ih, iw ))
-        self.s2 = self._make_layer(
-            block[block_types[1]], channels[1], channels[2], num_blocks[2], (ih , iw ))
+        # self.s0 = self._make_layer(
+        #     conv_3x3_bn, in_channels, channels[0], num_blocks[0], (ih , iw ))
+        #
+        # self.s1 = self._make_layer(
+        #     block[block_types[0]], channels[0], channels[1], num_blocks[1], (ih, iw ))
+        # self.s2 = self._make_layer(
+        #     block[block_types[1]], channels[1], channels[2], num_blocks[2], (ih , iw ))
         self.s3 = Vision_Transformer()
         # self.s3 = self._make_layer(
         #     block[block_types[2]], channels[2], channels[3], num_blocks[3], (ih // 16, iw // 16))
@@ -422,9 +422,9 @@ class CoAtNet(nn.Module):
         # self.fc = nn.Linear(channels[-1], num_classes, bias=False)
 
     def forward(self, x):
-        x = self.s0(x)
-        x = self.s1(x)
-        x = self.s2(x)
+        # x = self.s0(x)
+        # x = self.s1(x)
+        # x = self.s2(x)
         x = self.s3(x)
         # x = self.s4(x)
         #
@@ -483,7 +483,7 @@ def coatnet_4():
 
 def coat_new():
     num_blocks = [2, 2, 12, 28, 2]  # L
-    channels = [384, 768, 768]  # D
+    channels = [192, 384, 768]  # D
     return CoAtNet((224, 224), 3, num_blocks, channels, num_classes=100)
 
 def count_parameters(model):
@@ -505,7 +505,8 @@ def train(epoch, train_loader, device, optimizer, model, criterion):
         outputs = model.forward(inputs)
 
         _, predicted = torch.max(outputs.data, dim=1)  # predicted is the index for max value
-
+        # print('predict', predicted)
+        # print('target:', target)
         total += target.size(0)
         correct += (predicted == target).sum().item()
 
@@ -590,10 +591,11 @@ if __name__ == '__main__':
     model = model.to(device)
 
     criterion = torch.nn.CrossEntropyLoss()  # computes softmax and then the cross entropy
-    optimizer = torch.optim.SGD(
-        filter(lambda p: p.requires_grad,model.parameters()),
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=0.005,
-        momentum=0.5)  # 冲量
+        weight_decay=0.05
+        )  # 冲量
 
     print("Start training~~~")
     for epoch in range(100):
