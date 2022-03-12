@@ -8,10 +8,10 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import data_providers
-from local_attention import LocalAttention
+#from local_attention import LocalAttention
 
-from reformer_pytorch import default, LSHAttention, FullQKAttention, merge_dims, split_at_index, \
-    expand_dim, process_inputs_chunk
+# from reformer_pytorch import default, LSHAttention, FullQKAttention, merge_dims, split_at_index, \
+#     expand_dim, process_inputs_chunk
 
 from mae_main.util.pos_embed import interpolate_pos_embed
 from timm.models.layers import trunc_normal_
@@ -27,7 +27,7 @@ total_val_loss = []
 def conv_3x3_bn(inp, oup, image_size, downsample=False):
     stride = 1 if downsample == False else 2
     return nn.Sequential(
-        nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+        nn.Conv2d(inp, oup, 1, stride, 0, bias=False),
         nn.BatchNorm2d(oup),
         nn.GELU()
     )
@@ -80,8 +80,10 @@ class MBConv(nn.Module):
     def __init__(self, inp, oup, image_size, downsample=False, expansion=4):
         super().__init__()
         self.downsample = downsample
+        self.pool = nn.MaxPool2d(3, 1, 1)
         stride = 1 if self.downsample == False else 2
         hidden_dim = int(inp * expansion)
+        self.proj = nn.Conv2d(inp, oup, 1, 1, 0, bias=False)
 
         if self.downsample:
             self.pool = nn.MaxPool2d(3, 2, 1)
@@ -90,7 +92,7 @@ class MBConv(nn.Module):
         if expansion == 1:
             self.conv = nn.Sequential(
                 # dw
-                nn.Conv2d(hidden_dim, hidden_dim, 3, stride,
+                nn.Conv2d(hidden_dim, hidden_dim, 1, stride,
                           1, groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
                 nn.GELU(),
@@ -122,7 +124,7 @@ class MBConv(nn.Module):
         if self.downsample:
             return self.proj(self.pool(x)) + self.conv(x)
         else:
-            return x + self.conv(x)
+            return self.proj(self.pool(x)) + self.conv(x)
 
 
 class Attention(nn.Module):
@@ -184,186 +186,186 @@ class Attention(nn.Module):
         return out
 
 
-class LSHSelfAttention(nn.Module):
-    def __init__(self, dim, oup, heads=8, image_size=None, bucket_size=98, n_hashes=8, causal=False, dim_head=32, attn_chunks=1,
-                 random_rotations_per_head=False, attend_across_buckets=True, allow_duplicate_attention=True,
-                 num_mem_kv=0, one_value_head=False, use_full_attn=False, full_attn_thres=None, return_attn=False,
-                 post_attn_dropout=0., dropout=0., n_local_attn_heads=0, **kwargs):
-        super().__init__()
-        self.ih, self.iw = image_size
-        self.oup = oup
-
-        # print(str(self.ih)+"  "+str(self.iw))
-        assert dim_head or (dim % heads) == 0, 'dimensions must be divisible by number of heads'
-        assert n_local_attn_heads < heads, 'local attention heads must be less than number of heads'
-
-        dim_head = default(dim_head, dim // heads)
-        dim_heads = dim_head * heads
-
-        self.dim = dim
-        self.heads = heads
-        self.dim_head = dim_head
-        self.attn_chunks = default(attn_chunks, 1)
-
-        self.v_head_repeats = (heads if one_value_head else 1)
-        v_dim = dim_heads // self.v_head_repeats
-
-        # print("asdasd:"+str(self.dim))
-        # print("asdasd:" + str(self.oup))
-        self.temp1 = nn.Linear(192, self.dim, bias=False)   # 改动
-        self.temp2 = nn.Linear(384, self.dim, bias=False)   # 改动
-        self.temp3 = nn.Linear(768, self.dim, bias=False)   # 改动
-
-        self.toqk = nn.Linear(self.dim, dim_heads, bias=False)
-        self.tov = nn.Linear(dim, v_dim, bias=False)
-        self.to_out = nn.Linear(dim_heads, oup)
-
-        self.bucket_size = bucket_size
-        self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal,
-                                     random_rotations_per_head=random_rotations_per_head,
-                                     attend_across_buckets=attend_across_buckets,
-                                     allow_duplicate_attention=allow_duplicate_attention, return_attn=return_attn,
-                                     dropout=dropout, **kwargs)
-        self.full_attn = FullQKAttention(causal=causal, dropout=dropout)
-        self.post_attn_dropout = nn.Dropout(post_attn_dropout)
-
-        self.use_full_attn = use_full_attn
-        self.full_attn_thres = default(full_attn_thres, bucket_size)
-
-        self.num_mem_kv = num_mem_kv
-        self.mem_kv = nn.Parameter(torch.randn(1, num_mem_kv, dim, requires_grad=True)) if num_mem_kv > 0 else None
-
-        self.n_local_attn_heads = n_local_attn_heads
-        self.local_attn = LocalAttention(window_size=bucket_size * 2, causal=causal, dropout=dropout, shared_qk=True,
-                                         look_forward=(1 if not causal else 0))
-
-        self.callback = None
-
-    def forward(self, x, keys=None, input_mask=None, input_attn_mask=None, context_mask=None, pos_emb=None, **kwargs):
-        device, dtype = x.device, x.dtype
-        b, t, e, h, dh, m, l_h = *x.shape, self.heads, self.dim_head, self.num_mem_kv, self.n_local_attn_heads
-
-        mem_kv = default(self.mem_kv, torch.empty(b, 0, e, dtype=dtype, device=device))
-        mem = mem_kv.expand(b, m, -1)
-
-        keys = default(keys, torch.empty(b, 0, e, dtype=dtype, device=device))
-        c = keys.shape[1]
-
-        kv_len = t + m + c
-        use_full_attn = self.use_full_attn or kv_len <= self.full_attn_thres
-
-        x = torch.cat((x, mem, keys), dim=1)
-
-        # print("1 x:"+str(x.shape))
-
-        if x.shape[2] == 192:
-            x = self.temp1(x)
-        elif x.shape[2] == 768:
-            x = self.temp3(x)
-        else:
-            x = self.temp2(x)
-
-        qk = self.toqk(x)
-
-        v = self.tov(x)
-        v = v.repeat(1, 1, self.v_head_repeats)
-
-        def merge_heads(v):
-            return v.view(b, kv_len, h, -1).transpose(1, 2)
-
-        def split_heads(v):
-            return v.view(b, h, t, -1).transpose(1, 2).contiguous()
-
-        merge_batch_and_heads = partial(merge_dims, 0, 1)
-
-        qk, v = map(merge_heads, (qk, v))
-
-        has_local = l_h > 0
-        lsh_h = h - l_h
-
-        split_index_fn = partial(split_at_index, 1, l_h)
-        (lqk, qk), (lv, v) = map(split_index_fn, (qk, v))
-        lqk, qk, lv, v = map(merge_batch_and_heads, (lqk, qk, lv, v))
-
-        # print("2 v:" + str(x.shape))
-
-        masks = {}
-        if input_mask is not None or context_mask is not None:
-            default_mask = torch.tensor([True], device=device)
-            i_mask = default(input_mask, default_mask.expand(b, t))
-            m_mask = default_mask.expand(b, m)
-            c_mask = default(context_mask, default_mask.expand(b, c))
-            mask = torch.cat((i_mask, m_mask, c_mask), dim=1)
-            mask = merge_batch_and_heads(expand_dim(1, lsh_h, mask))
-            masks['input_mask'] = mask
-
-        if input_attn_mask is not None:
-            input_attn_mask = merge_batch_and_heads(expand_dim(1, lsh_h, input_attn_mask))
-            masks['input_attn_mask'] = input_attn_mask
-
-        attn_fn = self.lsh_attn if not use_full_attn else self.full_attn
-        partial_attn_fn = partial(attn_fn, query_len=t, pos_emb=pos_emb, **kwargs)
-        attn_fn_in_chunks = process_inputs_chunk(partial_attn_fn, chunks=self.attn_chunks)
-        out, attn, buckets = attn_fn_in_chunks(qk, v, **masks)
-        # print("3 out :"+str(out.shape))
-
-        if self.callback is not None:
-            self.callback(attn.reshape(b, lsh_h, t, -1), buckets.reshape(b, lsh_h, -1))
-
-        if has_local:
-            lqk, lv = lqk[:, :t], lv[:, :t]
-            local_out = self.local_attn(lqk, lqk, lv, input_mask=input_mask)
-            local_out = local_out.reshape(b, l_h, t, -1)
-            out = out.reshape(b, lsh_h, t, -1)
-            out = torch.cat((local_out, out), dim=1)
-
-        out = split_heads(out).view(b, t, -1)
-
-        out = self.to_out(out)  # 改动
-        # print("4 out:"+str(out.shape))
-        return self.post_attn_dropout(out)
-
-
-class Transformer(nn.Module):
-    def __init__(self, inp, oup, image_size, heads=8, dim_head=32, downsample=False, dropout=0.):
-        super().__init__()
-        hidden_dim = int(inp * 4)
-        self.ih, self.iw = image_size
-        self.downsample = downsample
-
-        self.layers = []
-
-        if self.downsample:
-            self.pool1 = nn.MaxPool2d(3, 2, 1)
-            self.pool2 = nn.MaxPool2d(3, 2, 1)
-            self.proj = nn.Conv2d(inp, oup, 1, 1, 0, bias=False)
-
-        dim = heads * dim_head
-        # self.attn = Attention(inp, oup, image_size, heads, dim_head, dropout)
-        #
-        self.attn = LSHSelfAttention(dim, oup, dim_head=dim_head, image_size=image_size, heads=heads, dropout=dropout)
-
-        self.ff = FeedForward(oup, hidden_dim, dropout)
-
-        self.attn = nn.Sequential(
-            Rearrange('b c ih iw -> b (ih iw) c'),
-            PreNorm(inp, self.attn, nn.LayerNorm),
-            Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
-        )
-
-        self.ff = nn.Sequential(
-            Rearrange('b c ih iw -> b (ih iw) c'),
-            PreNorm(oup, self.ff, nn.LayerNorm),
-            Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
-        )
-
-    def forward(self, x):
-        if self.downsample:
-            x = self.proj(self.pool1(x)) + self.attn(self.pool2(x))
-        else:
-            x = x + self.attn(x)
-        x = x + self.ff(x)
-        return x
+# class LSHSelfAttention(nn.Module):
+#     def __init__(self, dim, oup, heads=8, image_size=None, bucket_size=98, n_hashes=8, causal=False, dim_head=32, attn_chunks=1,
+#                  random_rotations_per_head=False, attend_across_buckets=True, allow_duplicate_attention=True,
+#                  num_mem_kv=0, one_value_head=False, use_full_attn=False, full_attn_thres=None, return_attn=False,
+#                  post_attn_dropout=0., dropout=0., n_local_attn_heads=0, **kwargs):
+#         super().__init__()
+#         self.ih, self.iw = image_size
+#         self.oup = oup
+#
+#         # print(str(self.ih)+"  "+str(self.iw))
+#         assert dim_head or (dim % heads) == 0, 'dimensions must be divisible by number of heads'
+#         assert n_local_attn_heads < heads, 'local attention heads must be less than number of heads'
+#
+#         dim_head = default(dim_head, dim // heads)
+#         dim_heads = dim_head * heads
+#
+#         self.dim = dim
+#         self.heads = heads
+#         self.dim_head = dim_head
+#         self.attn_chunks = default(attn_chunks, 1)
+#
+#         self.v_head_repeats = (heads if one_value_head else 1)
+#         v_dim = dim_heads // self.v_head_repeats
+#
+#         # print("asdasd:"+str(self.dim))
+#         # print("asdasd:" + str(self.oup))
+#         self.temp1 = nn.Linear(192, self.dim, bias=False)   # 改动
+#         self.temp2 = nn.Linear(384, self.dim, bias=False)   # 改动
+#         self.temp3 = nn.Linear(768, self.dim, bias=False)   # 改动
+#
+#         self.toqk = nn.Linear(self.dim, dim_heads, bias=False)
+#         self.tov = nn.Linear(dim, v_dim, bias=False)
+#         self.to_out = nn.Linear(dim_heads, oup)
+#
+#         self.bucket_size = bucket_size
+#         self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal,
+#                                      random_rotations_per_head=random_rotations_per_head,
+#                                      attend_across_buckets=attend_across_buckets,
+#                                      allow_duplicate_attention=allow_duplicate_attention, return_attn=return_attn,
+#                                      dropout=dropout, **kwargs)
+#         self.full_attn = FullQKAttention(causal=causal, dropout=dropout)
+#         self.post_attn_dropout = nn.Dropout(post_attn_dropout)
+#
+#         self.use_full_attn = use_full_attn
+#         self.full_attn_thres = default(full_attn_thres, bucket_size)
+#
+#         self.num_mem_kv = num_mem_kv
+#         self.mem_kv = nn.Parameter(torch.randn(1, num_mem_kv, dim, requires_grad=True)) if num_mem_kv > 0 else None
+#
+#         self.n_local_attn_heads = n_local_attn_heads
+#         self.local_attn = LocalAttention(window_size=bucket_size * 2, causal=causal, dropout=dropout, shared_qk=True,
+#                                          look_forward=(1 if not causal else 0))
+#
+#         self.callback = None
+#
+#     def forward(self, x, keys=None, input_mask=None, input_attn_mask=None, context_mask=None, pos_emb=None, **kwargs):
+#         device, dtype = x.device, x.dtype
+#         b, t, e, h, dh, m, l_h = *x.shape, self.heads, self.dim_head, self.num_mem_kv, self.n_local_attn_heads
+#
+#         mem_kv = default(self.mem_kv, torch.empty(b, 0, e, dtype=dtype, device=device))
+#         mem = mem_kv.expand(b, m, -1)
+#
+#         keys = default(keys, torch.empty(b, 0, e, dtype=dtype, device=device))
+#         c = keys.shape[1]
+#
+#         kv_len = t + m + c
+#         use_full_attn = self.use_full_attn or kv_len <= self.full_attn_thres
+#
+#         x = torch.cat((x, mem, keys), dim=1)
+#
+#         # print("1 x:"+str(x.shape))
+#
+#         if x.shape[2] == 192:
+#             x = self.temp1(x)
+#         elif x.shape[2] == 768:
+#             x = self.temp3(x)
+#         else:
+#             x = self.temp2(x)
+#
+#         qk = self.toqk(x)
+#
+#         v = self.tov(x)
+#         v = v.repeat(1, 1, self.v_head_repeats)
+#
+#         def merge_heads(v):
+#             return v.view(b, kv_len, h, -1).transpose(1, 2)
+#
+#         def split_heads(v):
+#             return v.view(b, h, t, -1).transpose(1, 2).contiguous()
+#
+#         merge_batch_and_heads = partial(merge_dims, 0, 1)
+#
+#         qk, v = map(merge_heads, (qk, v))
+#
+#         has_local = l_h > 0
+#         lsh_h = h - l_h
+#
+#         split_index_fn = partial(split_at_index, 1, l_h)
+#         (lqk, qk), (lv, v) = map(split_index_fn, (qk, v))
+#         lqk, qk, lv, v = map(merge_batch_and_heads, (lqk, qk, lv, v))
+#
+#         # print("2 v:" + str(x.shape))
+#
+#         masks = {}
+#         if input_mask is not None or context_mask is not None:
+#             default_mask = torch.tensor([True], device=device)
+#             i_mask = default(input_mask, default_mask.expand(b, t))
+#             m_mask = default_mask.expand(b, m)
+#             c_mask = default(context_mask, default_mask.expand(b, c))
+#             mask = torch.cat((i_mask, m_mask, c_mask), dim=1)
+#             mask = merge_batch_and_heads(expand_dim(1, lsh_h, mask))
+#             masks['input_mask'] = mask
+#
+#         if input_attn_mask is not None:
+#             input_attn_mask = merge_batch_and_heads(expand_dim(1, lsh_h, input_attn_mask))
+#             masks['input_attn_mask'] = input_attn_mask
+#
+#         attn_fn = self.lsh_attn if not use_full_attn else self.full_attn
+#         partial_attn_fn = partial(attn_fn, query_len=t, pos_emb=pos_emb, **kwargs)
+#         attn_fn_in_chunks = process_inputs_chunk(partial_attn_fn, chunks=self.attn_chunks)
+#         out, attn, buckets = attn_fn_in_chunks(qk, v, **masks)
+#         # print("3 out :"+str(out.shape))
+#
+#         if self.callback is not None:
+#             self.callback(attn.reshape(b, lsh_h, t, -1), buckets.reshape(b, lsh_h, -1))
+#
+#         if has_local:
+#             lqk, lv = lqk[:, :t], lv[:, :t]
+#             local_out = self.local_attn(lqk, lqk, lv, input_mask=input_mask)
+#             local_out = local_out.reshape(b, l_h, t, -1)
+#             out = out.reshape(b, lsh_h, t, -1)
+#             out = torch.cat((local_out, out), dim=1)
+#
+#         out = split_heads(out).view(b, t, -1)
+#
+#         out = self.to_out(out)  # 改动
+#         # print("4 out:"+str(out.shape))
+#         return self.post_attn_dropout(out)
+#
+#
+# class Transformer(nn.Module):
+#     def __init__(self, inp, oup, image_size, heads=8, dim_head=32, downsample=False, dropout=0.):
+#         super().__init__()
+#         hidden_dim = int(inp * 4)
+#         self.ih, self.iw = image_size
+#         self.downsample = downsample
+#
+#         self.layers = []
+#
+#         if self.downsample:
+#             self.pool1 = nn.MaxPool2d(3, 2, 1)
+#             self.pool2 = nn.MaxPool2d(3, 2, 1)
+#             self.proj = nn.Conv2d(inp, oup, 1, 1, 0, bias=False)
+#
+#         dim = heads * dim_head
+#         # self.attn = Attention(inp, oup, image_size, heads, dim_head, dropout)
+#         #
+#         self.attn = LSHSelfAttention(dim, oup, dim_head=dim_head, image_size=image_size, heads=heads, dropout=dropout)
+#
+#         self.ff = FeedForward(oup, hidden_dim, dropout)
+#
+#         self.attn = nn.Sequential(
+#             Rearrange('b c ih iw -> b (ih iw) c'),
+#             PreNorm(inp, self.attn, nn.LayerNorm),
+#             Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
+#         )
+#
+#         self.ff = nn.Sequential(
+#             Rearrange('b c ih iw -> b (ih iw) c'),
+#             PreNorm(oup, self.ff, nn.LayerNorm),
+#             Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
+#         )
+#
+#     def forward(self, x):
+#         if self.downsample:
+#             x = self.proj(self.pool1(x)) + self.attn(self.pool2(x))
+#         else:
+#             x = x + self.attn(x)
+#         x = x + self.ff(x)
+#         return x
 
 def Vision_Transformer():
     global_pool = True
@@ -399,15 +401,17 @@ class CoAtNet(nn.Module):
                  block_types=['C', 'C', 'T', 'T','ViT']):
         super().__init__()
         ih, iw = image_size
-        block = {'C': MBConv, 'T': Transformer, 'ViT': Vision_Transformer}
+        block = {'C': MBConv}#, 'T': Transformer, 'ViT': Vision_Transformer}
+
+
 
         self.s0 = self._make_layer(
-            conv_3x3_bn, in_channels, channels[0], num_blocks[0], (ih // 2, iw // 2))
+            conv_3x3_bn, in_channels, channels[0], num_blocks[0], (ih , iw ))
 
         self.s1 = self._make_layer(
-            block[block_types[0]], channels[0], channels[1], num_blocks[1], (ih // 4, iw // 4))
+            block[block_types[0]], channels[0], channels[1], num_blocks[1], (ih, iw ))
         self.s2 = self._make_layer(
-            block[block_types[1]], channels[1], channels[2], num_blocks[2], (ih // 8, iw // 8))
+            block[block_types[1]], channels[1], channels[2], num_blocks[2], (ih , iw ))
         self.s3 = Vision_Transformer()
         # self.s3 = self._make_layer(
         #     block[block_types[2]], channels[2], channels[3], num_blocks[3], (ih // 16, iw // 16))
@@ -434,7 +438,7 @@ class CoAtNet(nn.Module):
         for i in range(depth):
             if i == 0:
                 # print("true")
-                layers.append(block(inp, oup, image_size, downsample=True))
+                layers.append(block(inp, oup, image_size, downsample=False))
             else:
                 # print("false")
                 layers.append(block(oup, oup, image_size))
@@ -574,7 +578,7 @@ if __name__ == '__main__':
                                         transform=transform_test,
                                         download=True)  # initialize our rngs using the argument set seed
 
-    train_loader = DataLoader(train_data, batch_size=16, shuffle=True, num_workers=1)
+    train_loader = DataLoader(train_data, batch_size=1, shuffle=True, num_workers=1)
     val_loader = DataLoader(val_data, batch_size=1, shuffle=True, num_workers=1)
     test_loader = DataLoader(test_data, batch_size=1, shuffle=True, num_workers=1)
 
