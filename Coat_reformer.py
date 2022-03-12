@@ -8,10 +8,10 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import data_providers
-# from local_attention import LocalAttention
+from local_attention import LocalAttention
 
-# from reformer_pytorch import default, LSHAttention, FullQKAttention, merge_dims, split_at_index, \
-#     expand_dim, process_inputs_chunk
+from reformer_pytorch import default, LSHAttention, FullQKAttention, merge_dims, split_at_index, \
+    expand_dim, process_inputs_chunk
 
 from mae_main.util.pos_embed import interpolate_pos_embed
 from timm.models.layers import trunc_normal_
@@ -125,245 +125,245 @@ class MBConv(nn.Module):
             return x + self.conv(x)
 
 
-# class Attention(nn.Module):
-#     def __init__(self, inp, oup, image_size, heads=8, dim_head=32, dropout=0.):
-#         super().__init__()
-#         inner_dim = dim_head * heads
-#         project_out = not (heads == 1 and dim_head == inp)
+class Attention(nn.Module):
+    def __init__(self, inp, oup, image_size, heads=8, dim_head=32, dropout=0.):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == inp)
 
-#         self.ih, self.iw = image_size
+        self.ih, self.iw = image_size
 
-#         self.heads = heads
-#         self.scale = dim_head ** -0.5
+        self.heads = heads
+        self.scale = dim_head ** -0.5
 
-#         # parameter table of relative position bias
-#         self.relative_bias_table = nn.Parameter(
-#             torch.zeros((2 * self.ih - 1) * (2 * self.iw - 1), heads))
+        # parameter table of relative position bias
+        self.relative_bias_table = nn.Parameter(
+            torch.zeros((2 * self.ih - 1) * (2 * self.iw - 1), heads))
 
-#         coords = torch.meshgrid((torch.arange(self.ih), torch.arange(self.iw)))
-#         coords = torch.flatten(torch.stack(coords), 1)
-#         relative_coords = coords[:, :, None] - coords[:, None, :]
+        coords = torch.meshgrid((torch.arange(self.ih), torch.arange(self.iw)))
+        coords = torch.flatten(torch.stack(coords), 1)
+        relative_coords = coords[:, :, None] - coords[:, None, :]
 
-#         relative_coords[0] += self.ih - 1
-#         relative_coords[1] += self.iw - 1
-#         relative_coords[0] *= 2 * self.iw - 1
-#         relative_coords = rearrange(relative_coords, 'c h w -> h w c')
-#         relative_index = relative_coords.sum(-1).flatten().unsqueeze(1)
-#         self.register_buffer("relative_index", relative_index)
+        relative_coords[0] += self.ih - 1
+        relative_coords[1] += self.iw - 1
+        relative_coords[0] *= 2 * self.iw - 1
+        relative_coords = rearrange(relative_coords, 'c h w -> h w c')
+        relative_index = relative_coords.sum(-1).flatten().unsqueeze(1)
+        self.register_buffer("relative_index", relative_index)
 
-#         self.attend = nn.Softmax(dim=-1)
-#         self.to_qkv = nn.Linear(inp, inner_dim * 3, bias=False)
+        self.attend = nn.Softmax(dim=-1)
+        self.to_qkv = nn.Linear(inp, inner_dim * 3, bias=False)
 
-#         self.to_out = nn.Sequential(
-#             nn.Linear(inner_dim, oup),
-#             nn.Dropout(dropout)
-#         ) if project_out else nn.Identity()
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, oup),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
 
-#     def forward(self, x):
-#         qkv = self.to_qkv(x).chunk(3, dim=-1)
-#         q, k, v = map(lambda t: rearrange(
-#             t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+    def forward(self, x):
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(
+            t, 'b n (h d) -> b h n d', h=self.heads), qkv)
 
-#         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-#         # Use "gather" for more efficiency on GPUs
-#         relative_bias = self.relative_bias_table.gather(
-#             0, self.relative_index.repeat(1, self.heads))
-#         relative_bias = rearrange(
-#             relative_bias, '(h w) c -> 1 c h w', h=self.ih * self.iw, w=self.ih * self.iw)
-#         dots = dots + relative_bias
+        # Use "gather" for more efficiency on GPUs
+        relative_bias = self.relative_bias_table.gather(
+            0, self.relative_index.repeat(1, self.heads))
+        relative_bias = rearrange(
+            relative_bias, '(h w) c -> 1 c h w', h=self.ih * self.iw, w=self.ih * self.iw)
+        dots = dots + relative_bias
 
-#         attn = self.attend(dots)
-#         out = torch.matmul(attn, v)
-#         out = rearrange(out, 'b h n d -> b n (h d)')
-#         out = self.to_out(out)
-#         # print(out.shape)
+        attn = self.attend(dots)
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+        # print(out.shape)
 
-#         # torch.Size([16, 196, 384])
-#         # torch.Size([16, 49, 768])
-#         return out
-
-
-# class LSHSelfAttention(nn.Module):
-#     def __init__(self, dim, oup, heads=8, image_size=None, bucket_size=98, n_hashes=8, causal=False, dim_head=32, attn_chunks=1,
-#                  random_rotations_per_head=False, attend_across_buckets=True, allow_duplicate_attention=True,
-#                  num_mem_kv=0, one_value_head=False, use_full_attn=False, full_attn_thres=None, return_attn=False,
-#                  post_attn_dropout=0., dropout=0., n_local_attn_heads=0, **kwargs):
-#         super().__init__()
-#         self.ih, self.iw = image_size
-#         self.oup = oup
-
-#         # print(str(self.ih)+"  "+str(self.iw))
-#         assert dim_head or (dim % heads) == 0, 'dimensions must be divisible by number of heads'
-#         assert n_local_attn_heads < heads, 'local attention heads must be less than number of heads'
-
-#         dim_head = default(dim_head, dim // heads)
-#         dim_heads = dim_head * heads
-
-#         self.dim = dim
-#         self.heads = heads
-#         self.dim_head = dim_head
-#         self.attn_chunks = default(attn_chunks, 1)
-
-#         self.v_head_repeats = (heads if one_value_head else 1)
-#         v_dim = dim_heads // self.v_head_repeats
-
-#         # print("asdasd:"+str(self.dim))
-#         # print("asdasd:" + str(self.oup))
-#         self.temp1 = nn.Linear(192, self.dim, bias=False)   # 改动
-#         self.temp2 = nn.Linear(384, self.dim, bias=False)   # 改动
-#         self.temp3 = nn.Linear(768, self.dim, bias=False)   # 改动
-
-#         self.toqk = nn.Linear(self.dim, dim_heads, bias=False)
-#         self.tov = nn.Linear(dim, v_dim, bias=False)
-#         self.to_out = nn.Linear(dim_heads, oup)
-
-#         self.bucket_size = bucket_size
-#         self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal,
-#                                      random_rotations_per_head=random_rotations_per_head,
-#                                      attend_across_buckets=attend_across_buckets,
-#                                      allow_duplicate_attention=allow_duplicate_attention, return_attn=return_attn,
-#                                      dropout=dropout, **kwargs)
-#         self.full_attn = FullQKAttention(causal=causal, dropout=dropout)
-#         self.post_attn_dropout = nn.Dropout(post_attn_dropout)
-
-#         self.use_full_attn = use_full_attn
-#         self.full_attn_thres = default(full_attn_thres, bucket_size)
-
-#         self.num_mem_kv = num_mem_kv
-#         self.mem_kv = nn.Parameter(torch.randn(1, num_mem_kv, dim, requires_grad=True)) if num_mem_kv > 0 else None
-
-#         self.n_local_attn_heads = n_local_attn_heads
-#         self.local_attn = LocalAttention(window_size=bucket_size * 2, causal=causal, dropout=dropout, shared_qk=True,
-#                                          look_forward=(1 if not causal else 0))
-
-#         self.callback = None
-
-#     def forward(self, x, keys=None, input_mask=None, input_attn_mask=None, context_mask=None, pos_emb=None, **kwargs):
-#         device, dtype = x.device, x.dtype
-#         b, t, e, h, dh, m, l_h = *x.shape, self.heads, self.dim_head, self.num_mem_kv, self.n_local_attn_heads
-
-#         mem_kv = default(self.mem_kv, torch.empty(b, 0, e, dtype=dtype, device=device))
-#         mem = mem_kv.expand(b, m, -1)
-
-#         keys = default(keys, torch.empty(b, 0, e, dtype=dtype, device=device))
-#         c = keys.shape[1]
-
-#         kv_len = t + m + c
-#         use_full_attn = self.use_full_attn or kv_len <= self.full_attn_thres
-
-#         x = torch.cat((x, mem, keys), dim=1)
-
-#         # print("1 x:"+str(x.shape))
-
-#         if x.shape[2] == 192:
-#             x = self.temp1(x)
-#         elif x.shape[2] == 768:
-#             x = self.temp3(x)
-#         else:
-#             x = self.temp2(x)
-
-#         qk = self.toqk(x)
-
-#         v = self.tov(x)
-#         v = v.repeat(1, 1, self.v_head_repeats)
-
-#         def merge_heads(v):
-#             return v.view(b, kv_len, h, -1).transpose(1, 2)
-
-#         def split_heads(v):
-#             return v.view(b, h, t, -1).transpose(1, 2).contiguous()
-
-#         merge_batch_and_heads = partial(merge_dims, 0, 1)
-
-#         qk, v = map(merge_heads, (qk, v))
-
-#         has_local = l_h > 0
-#         lsh_h = h - l_h
-
-#         split_index_fn = partial(split_at_index, 1, l_h)
-#         (lqk, qk), (lv, v) = map(split_index_fn, (qk, v))
-#         lqk, qk, lv, v = map(merge_batch_and_heads, (lqk, qk, lv, v))
-
-#         # print("2 v:" + str(x.shape))
-
-#         masks = {}
-#         if input_mask is not None or context_mask is not None:
-#             default_mask = torch.tensor([True], device=device)
-#             i_mask = default(input_mask, default_mask.expand(b, t))
-#             m_mask = default_mask.expand(b, m)
-#             c_mask = default(context_mask, default_mask.expand(b, c))
-#             mask = torch.cat((i_mask, m_mask, c_mask), dim=1)
-#             mask = merge_batch_and_heads(expand_dim(1, lsh_h, mask))
-#             masks['input_mask'] = mask
-
-#         if input_attn_mask is not None:
-#             input_attn_mask = merge_batch_and_heads(expand_dim(1, lsh_h, input_attn_mask))
-#             masks['input_attn_mask'] = input_attn_mask
-
-#         attn_fn = self.lsh_attn if not use_full_attn else self.full_attn
-#         partial_attn_fn = partial(attn_fn, query_len=t, pos_emb=pos_emb, **kwargs)
-#         attn_fn_in_chunks = process_inputs_chunk(partial_attn_fn, chunks=self.attn_chunks)
-#         out, attn, buckets = attn_fn_in_chunks(qk, v, **masks)
-#         # print("3 out :"+str(out.shape))
-
-#         if self.callback is not None:
-#             self.callback(attn.reshape(b, lsh_h, t, -1), buckets.reshape(b, lsh_h, -1))
-
-#         if has_local:
-#             lqk, lv = lqk[:, :t], lv[:, :t]
-#             local_out = self.local_attn(lqk, lqk, lv, input_mask=input_mask)
-#             local_out = local_out.reshape(b, l_h, t, -1)
-#             out = out.reshape(b, lsh_h, t, -1)
-#             out = torch.cat((local_out, out), dim=1)
-
-#         out = split_heads(out).view(b, t, -1)
-
-#         out = self.to_out(out)  # 改动
-#         # print("4 out:"+str(out.shape))
-#         return self.post_attn_dropout(out)
+        # torch.Size([16, 196, 384])
+        # torch.Size([16, 49, 768])
+        return out
 
 
-# class Transformer(nn.Module):
-#     def __init__(self, inp, oup, image_size, heads=8, dim_head=32, downsample=False, dropout=0.):
-#         super().__init__()
-#         hidden_dim = int(inp * 4)
-#         self.ih, self.iw = image_size
-#         self.downsample = downsample
+class LSHSelfAttention(nn.Module):
+    def __init__(self, dim, oup, heads=8, image_size=None, bucket_size=98, n_hashes=8, causal=False, dim_head=32, attn_chunks=1,
+                 random_rotations_per_head=False, attend_across_buckets=True, allow_duplicate_attention=True,
+                 num_mem_kv=0, one_value_head=False, use_full_attn=False, full_attn_thres=None, return_attn=False,
+                 post_attn_dropout=0., dropout=0., n_local_attn_heads=0, **kwargs):
+        super().__init__()
+        self.ih, self.iw = image_size
+        self.oup = oup
 
-#         self.layers = []
+        # print(str(self.ih)+"  "+str(self.iw))
+        assert dim_head or (dim % heads) == 0, 'dimensions must be divisible by number of heads'
+        assert n_local_attn_heads < heads, 'local attention heads must be less than number of heads'
 
-#         if self.downsample:
-#             self.pool1 = nn.MaxPool2d(3, 2, 1)
-#             self.pool2 = nn.MaxPool2d(3, 2, 1)
-#             self.proj = nn.Conv2d(inp, oup, 1, 1, 0, bias=False)
+        dim_head = default(dim_head, dim // heads)
+        dim_heads = dim_head * heads
 
-#         dim = heads * dim_head
-#         # self.attn = Attention(inp, oup, image_size, heads, dim_head, dropout)
-#         #
-#         self.attn = LSHSelfAttention(dim, oup, dim_head=dim_head, image_size=image_size, heads=heads, dropout=dropout)
+        self.dim = dim
+        self.heads = heads
+        self.dim_head = dim_head
+        self.attn_chunks = default(attn_chunks, 1)
 
-#         self.ff = FeedForward(oup, hidden_dim, dropout)
+        self.v_head_repeats = (heads if one_value_head else 1)
+        v_dim = dim_heads // self.v_head_repeats
 
-#         self.attn = nn.Sequential(
-#             Rearrange('b c ih iw -> b (ih iw) c'),
-#             PreNorm(inp, self.attn, nn.LayerNorm),
-#             Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
-#         )
+        # print("asdasd:"+str(self.dim))
+        # print("asdasd:" + str(self.oup))
+        self.temp1 = nn.Linear(192, self.dim, bias=False)   # 改动
+        self.temp2 = nn.Linear(384, self.dim, bias=False)   # 改动
+        self.temp3 = nn.Linear(768, self.dim, bias=False)   # 改动
 
-#         self.ff = nn.Sequential(
-#             Rearrange('b c ih iw -> b (ih iw) c'),
-#             PreNorm(oup, self.ff, nn.LayerNorm),
-#             Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
-#         )
+        self.toqk = nn.Linear(self.dim, dim_heads, bias=False)
+        self.tov = nn.Linear(dim, v_dim, bias=False)
+        self.to_out = nn.Linear(dim_heads, oup)
 
-#     def forward(self, x):
-#         if self.downsample:
-#             x = self.proj(self.pool1(x)) + self.attn(self.pool2(x))
-#         else:
-#             x = x + self.attn(x)
-#         x = x + self.ff(x)
-#         return x
+        self.bucket_size = bucket_size
+        self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal,
+                                     random_rotations_per_head=random_rotations_per_head,
+                                     attend_across_buckets=attend_across_buckets,
+                                     allow_duplicate_attention=allow_duplicate_attention, return_attn=return_attn,
+                                     dropout=dropout, **kwargs)
+        self.full_attn = FullQKAttention(causal=causal, dropout=dropout)
+        self.post_attn_dropout = nn.Dropout(post_attn_dropout)
+
+        self.use_full_attn = use_full_attn
+        self.full_attn_thres = default(full_attn_thres, bucket_size)
+
+        self.num_mem_kv = num_mem_kv
+        self.mem_kv = nn.Parameter(torch.randn(1, num_mem_kv, dim, requires_grad=True)) if num_mem_kv > 0 else None
+
+        self.n_local_attn_heads = n_local_attn_heads
+        self.local_attn = LocalAttention(window_size=bucket_size * 2, causal=causal, dropout=dropout, shared_qk=True,
+                                         look_forward=(1 if not causal else 0))
+
+        self.callback = None
+
+    def forward(self, x, keys=None, input_mask=None, input_attn_mask=None, context_mask=None, pos_emb=None, **kwargs):
+        device, dtype = x.device, x.dtype
+        b, t, e, h, dh, m, l_h = *x.shape, self.heads, self.dim_head, self.num_mem_kv, self.n_local_attn_heads
+
+        mem_kv = default(self.mem_kv, torch.empty(b, 0, e, dtype=dtype, device=device))
+        mem = mem_kv.expand(b, m, -1)
+
+        keys = default(keys, torch.empty(b, 0, e, dtype=dtype, device=device))
+        c = keys.shape[1]
+
+        kv_len = t + m + c
+        use_full_attn = self.use_full_attn or kv_len <= self.full_attn_thres
+
+        x = torch.cat((x, mem, keys), dim=1)
+
+        # print("1 x:"+str(x.shape))
+
+        if x.shape[2] == 192:
+            x = self.temp1(x)
+        elif x.shape[2] == 768:
+            x = self.temp3(x)
+        else:
+            x = self.temp2(x)
+
+        qk = self.toqk(x)
+
+        v = self.tov(x)
+        v = v.repeat(1, 1, self.v_head_repeats)
+
+        def merge_heads(v):
+            return v.view(b, kv_len, h, -1).transpose(1, 2)
+
+        def split_heads(v):
+            return v.view(b, h, t, -1).transpose(1, 2).contiguous()
+
+        merge_batch_and_heads = partial(merge_dims, 0, 1)
+
+        qk, v = map(merge_heads, (qk, v))
+
+        has_local = l_h > 0
+        lsh_h = h - l_h
+
+        split_index_fn = partial(split_at_index, 1, l_h)
+        (lqk, qk), (lv, v) = map(split_index_fn, (qk, v))
+        lqk, qk, lv, v = map(merge_batch_and_heads, (lqk, qk, lv, v))
+
+        # print("2 v:" + str(x.shape))
+
+        masks = {}
+        if input_mask is not None or context_mask is not None:
+            default_mask = torch.tensor([True], device=device)
+            i_mask = default(input_mask, default_mask.expand(b, t))
+            m_mask = default_mask.expand(b, m)
+            c_mask = default(context_mask, default_mask.expand(b, c))
+            mask = torch.cat((i_mask, m_mask, c_mask), dim=1)
+            mask = merge_batch_and_heads(expand_dim(1, lsh_h, mask))
+            masks['input_mask'] = mask
+
+        if input_attn_mask is not None:
+            input_attn_mask = merge_batch_and_heads(expand_dim(1, lsh_h, input_attn_mask))
+            masks['input_attn_mask'] = input_attn_mask
+
+        attn_fn = self.lsh_attn if not use_full_attn else self.full_attn
+        partial_attn_fn = partial(attn_fn, query_len=t, pos_emb=pos_emb, **kwargs)
+        attn_fn_in_chunks = process_inputs_chunk(partial_attn_fn, chunks=self.attn_chunks)
+        out, attn, buckets = attn_fn_in_chunks(qk, v, **masks)
+        # print("3 out :"+str(out.shape))
+
+        if self.callback is not None:
+            self.callback(attn.reshape(b, lsh_h, t, -1), buckets.reshape(b, lsh_h, -1))
+
+        if has_local:
+            lqk, lv = lqk[:, :t], lv[:, :t]
+            local_out = self.local_attn(lqk, lqk, lv, input_mask=input_mask)
+            local_out = local_out.reshape(b, l_h, t, -1)
+            out = out.reshape(b, lsh_h, t, -1)
+            out = torch.cat((local_out, out), dim=1)
+
+        out = split_heads(out).view(b, t, -1)
+
+        out = self.to_out(out)  # 改动
+        # print("4 out:"+str(out.shape))
+        return self.post_attn_dropout(out)
+
+
+class Transformer(nn.Module):
+    def __init__(self, inp, oup, image_size, heads=8, dim_head=32, downsample=False, dropout=0.):
+        super().__init__()
+        hidden_dim = int(inp * 4)
+        self.ih, self.iw = image_size
+        self.downsample = downsample
+
+        self.layers = []
+
+        if self.downsample:
+            self.pool1 = nn.MaxPool2d(3, 2, 1)
+            self.pool2 = nn.MaxPool2d(3, 2, 1)
+            self.proj = nn.Conv2d(inp, oup, 1, 1, 0, bias=False)
+
+        dim = heads * dim_head
+        # self.attn = Attention(inp, oup, image_size, heads, dim_head, dropout)
+        #
+        self.attn = LSHSelfAttention(dim, oup, dim_head=dim_head, image_size=image_size, heads=heads, dropout=dropout)
+
+        self.ff = FeedForward(oup, hidden_dim, dropout)
+
+        self.attn = nn.Sequential(
+            Rearrange('b c ih iw -> b (ih iw) c'),
+            PreNorm(inp, self.attn, nn.LayerNorm),
+            Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
+        )
+
+        self.ff = nn.Sequential(
+            Rearrange('b c ih iw -> b (ih iw) c'),
+            PreNorm(oup, self.ff, nn.LayerNorm),
+            Rearrange('b (ih iw) c -> b c ih iw', ih=self.ih, iw=self.iw)
+        )
+
+    def forward(self, x):
+        if self.downsample:
+            x = self.proj(self.pool1(x)) + self.attn(self.pool2(x))
+        else:
+            x = x + self.attn(x)
+        x = x + self.ff(x)
+        return x
 
 def Vision_Transformer():
     global_pool = True
@@ -389,6 +389,9 @@ def Vision_Transformer():
         assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
     # manually initialize fc layer
     trunc_normal_(model.head.weight, std=2e-5)
+    for n, p in model.named_parameters():
+        if n not in ['head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias']:
+            p.requires_grad = False
     return model
 
 class CoAtNet(nn.Module):
@@ -583,7 +586,10 @@ if __name__ == '__main__':
     model = model.to(device)
 
     criterion = torch.nn.CrossEntropyLoss()  # computes softmax and then the cross entropy
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.005, momentum=0.5)  # 冲量
+    optimizer = torch.optim.SGD(
+        filter(lambda p: p.requires_grad,model.parameters()),
+        lr=0.005,
+        momentum=0.5)  # 冲量
 
     print("Start training~~~")
     for epoch in range(100):
